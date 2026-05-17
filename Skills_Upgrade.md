@@ -92,6 +92,7 @@ ppt-generator/
 
 ---
 
+
 ## Step 1 — Scaffold `.claude/` and `specs/`
 
 Run from the project root:
