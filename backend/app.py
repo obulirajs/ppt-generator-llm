@@ -21,10 +21,11 @@ from utils import document_parser, llm_service, ppt_generator
 # Import database components
 from database import init_database
 from config import (
-    SESSION_CONFIG, 
+    SESSION_CONFIG,
     TEMPLATE_CONFIG,
     PRESENTATION_TYPES,
-    GENERATION_CONFIG
+    GENERATION_CONFIG,
+    VERSIONING_CONFIG
 )
 
 
@@ -221,14 +222,14 @@ def safe_filename_for_download(filename):
 def get_or_create_session_id():
     """
     Get existing session ID from Flask session or create a new one
-    
+
     Returns:
         str: Session ID
     """
     if 'session_id' not in session:
         session['session_id'] = str(uuid.uuid4())
         session.permanent = True
-        
+
         # Create user in database if database is available
         if db_manager:
             try:
@@ -236,8 +237,21 @@ def get_or_create_session_id():
                 logger.info(f"Created new session: {session['session_id']}")
             except Exception as e:
                 logger.error(f"Failed to create user in database: {str(e)}")
-    
+
     return session['session_id']
+
+
+def _lineage_owned_by_session(lineage_id, session_id):
+    """
+    Cheap ownership probe used by version-detail routes.
+
+    Returns True only when the lineage exists AND has at least one row
+    matching the calling session. False covers both "missing" and
+    "exists but owned by another session" — the existence-leak guard.
+    """
+    if not db_manager:
+        return False
+    return db_manager.lineage_exists_for_session(lineage_id, session_id)
 
 
 # ==================== API ROUTES ====================
@@ -592,7 +606,27 @@ def generate_ppt():
                 history = db_manager.save_generation_history(history_data)
                 generation_id = history.get('id')
                 logger.info(f"Generation history saved with ID: {generation_id}")
-                
+
+                # Feature 001 — presentation versioning foundation:
+                # persist v1 of this lineage. Nested try/except so a version-save
+                # failure does not skip the template-usage / preferences updates
+                # below, and never breaks the user-facing response (plan §6 risk #1).
+                try:
+                    db_manager.save_presentation_version({
+                        'lineage_id': generation_id,
+                        'version_number': 1,
+                        'label': VERSIONING_CONFIG['v1_label'],
+                        'note': None,
+                        'slide_structure': generation_structure,
+                        'file_path': ppt_file_path,
+                        'filename': os.path.basename(ppt_file_path),
+                        'is_stub': False,
+                        'session_id': session_id,
+                    })
+                    logger.info(f"Presentation version v1 saved for lineage {generation_id}")
+                except Exception as version_error:
+                    logger.error(f"Failed to save presentation version v1: {str(version_error)}")
+
                 # Update template usage count
                 if template_id:
                     db_manager.update_template_usage(template_id)
@@ -1301,6 +1335,192 @@ def get_generation_history():
         return create_error_response(f"Failed to get history: {str(e)}", 'history', 500)
     
     
+# ==================== PRESENTATION VERSIONING ENDPOINTS ====================
+
+@app.route('/api/lineages', methods=['GET'])
+def list_lineages():
+    """
+    List all presentation lineages owned by the current session.
+
+    Query params:
+        limit (int, optional): max entries; clamped to
+            [1, VERSIONING_CONFIG['max_lineage_list_limit']].
+            Defaults to VERSIONING_CONFIG['default_lineage_list_limit'].
+
+    Returns:
+        JSON with `lineages` list (newest-first by latest version's
+        created_at), `total`, `limit`, and `timestamp`. Flat shape
+        matching /api/history.
+    """
+    try:
+        if not db_manager:
+            return create_error_response("Database not available", 'database', 503)
+
+        session_id = get_or_create_session_id()
+
+        default_limit = VERSIONING_CONFIG.get('default_lineage_list_limit', 20)
+        max_limit = VERSIONING_CONFIG.get('max_lineage_list_limit', 100)
+        limit = request.args.get('limit', default_limit, type=int)
+        limit = max(1, min(limit, max_limit))
+
+        logger.info(f"Fetching lineages for session: {session_id[:8]}... (limit={limit})")
+
+        lineages = db_manager.get_lineages_for_session(session_id, limit=limit)
+
+        return jsonify({
+            'success': True,
+            'lineages': lineages,
+            'total': len(lineages),
+            'limit': limit,
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to list lineages: {str(e)}", exc_info=True)
+        return create_error_response(f"Failed to list lineages: {str(e)}", 'lineages', 500)
+
+
+@app.route('/api/lineages/<int:lineage_id>/versions', methods=['GET'])
+def list_versions_in_lineage(lineage_id):
+    """
+    List versions in a lineage owned by the current session.
+
+    Versions are returned oldest-first (v1 → vN). Each entry exposes
+    metadata only — slide_structure is intentionally omitted here
+    (potentially large); callers fetch a specific snapshot via the
+    single-version endpoint below.
+
+    Returns 404 `not_found` when the lineage doesn't exist OR exists
+    but is owned by a different session — the two cases are
+    indistinguishable to the caller (existence-leak guard).
+    """
+    try:
+        if not db_manager:
+            return create_error_response("Database not available", 'database', 503)
+
+        session_id = get_or_create_session_id()
+        logger.info(
+            f"Fetching versions for lineage {lineage_id}, session: {session_id[:8]}..."
+        )
+
+        versions = db_manager.get_versions_for_lineage(lineage_id, session_id)
+        if versions is None:
+            return create_error_response("Not found", 'not_found', 404)
+
+        projected = [
+            {
+                'version_number': v['version_number'],
+                'label': v['label'],
+                'note': v['note'],
+                'created_at': v['created_at'],
+                'has_snapshot': v.get('slide_structure') is not None,
+            }
+            for v in versions
+        ]
+
+        return jsonify({
+            'success': True,
+            'lineage_id': lineage_id,
+            'versions': projected,
+            'total': len(projected),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to list versions: {str(e)}", exc_info=True)
+        return create_error_response(f"Failed to list versions: {str(e)}", 'versions', 500)
+
+
+@app.route('/api/lineages/<int:lineage_id>/versions/<int:version_number>', methods=['GET'])
+def get_version_detail(lineage_id, version_number):
+    """
+    Fetch a single version's full content, including slide_structure.
+
+    Returns 404 `not_found` when the version doesn't exist OR exists
+    but is owned by a different session — same existence-leak guard
+    as the list endpoint above.
+    """
+    try:
+        if not db_manager:
+            return create_error_response("Database not available", 'database', 503)
+
+        session_id = get_or_create_session_id()
+        logger.info(
+            f"Fetching version {version_number} of lineage {lineage_id}, "
+            f"session: {session_id[:8]}..."
+        )
+
+        version = db_manager.get_version(lineage_id, version_number, session_id)
+        if version is None:
+            return create_error_response("Not found", 'not_found', 404)
+
+        return jsonify({
+            'success': True,
+            'lineage_id': lineage_id,
+            'version_number': version['version_number'],
+            'label': version['label'],
+            'note': version['note'],
+            'created_at': version['created_at'],
+            'filename': version['filename'],
+            'slide_structure': version['slide_structure'],
+            'is_stub': version['is_stub'],
+            'timestamp': datetime.utcnow().isoformat()
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to get version: {str(e)}", exc_info=True)
+        return create_error_response(f"Failed to get version: {str(e)}", 'version', 500)
+
+
+@app.route('/api/lineages/<int:lineage_id>/versions/<int:version_number>/download', methods=['GET'])
+def download_version(lineage_id, version_number):
+    """
+    Stream a specific version's .pptx file as an attachment.
+
+    Returns 404 `not_found` for all of:
+      - row doesn't exist
+      - row exists but is owned by a different session
+      - row has NULL file_path (stub backfill row)
+      - file_path is set but the file is gone from disk (cleanup sweeper
+        or manual delete)
+    All four collapse to the same response to preserve the existence-
+    leak guard (spec §Behavior / Resolved Decisions).
+    """
+    try:
+        if not db_manager:
+            return create_error_response("Database not available", 'database', 503)
+
+        session_id = get_or_create_session_id()
+        logger.info(
+            f"Downloading version {version_number} of lineage {lineage_id}, "
+            f"session: {session_id[:8]}..."
+        )
+
+        version = db_manager.get_version(lineage_id, version_number, session_id)
+        if version is None:
+            return create_error_response("Not found", 'not_found', 404)
+
+        file_path = version.get('file_path')
+        if not file_path or not os.path.exists(file_path):
+            return create_error_response("Not found", 'not_found', 404)
+
+        download_name = version.get('filename') or os.path.basename(file_path)
+        return send_file(
+            file_path,
+            mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            as_attachment=True,
+            download_name=download_name,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to download version: {str(e)}", exc_info=True)
+        return create_error_response(
+            f"Failed to download version: {str(e)}",
+            'version_download',
+            500,
+        )
+
+
 # ==================== ERROR HANDLERS ====================
 
 @app.errorhandler(404)

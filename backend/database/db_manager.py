@@ -8,15 +8,16 @@ import uuid
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, func
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.exc import SQLAlchemyError
 
 from database.models import (
     Base, User, Template, StructureConfig, SectionTemplate,
-    GenerationHistory, UserPreference, ContentAnalysis, PromptTemplate
+    GenerationHistory, UserPreference, ContentAnalysis, PromptTemplate,
+    PresentationVersion
 )
-from config import DATABASE_CONFIG, PRESENTATION_TYPES, TEMPLATE_CONFIG
+from config import DATABASE_CONFIG, PRESENTATION_TYPES, TEMPLATE_CONFIG, VERSIONING_CONFIG
 
 class DatabaseManager:
     """Manages all database operations for the PPT Generator"""
@@ -41,10 +42,13 @@ class DatabaseManager:
         
         # Create tables if they don't exist
         self._create_tables()
-        
+
         # Initialize default data
         self._initialize_defaults()
-    
+
+        # Backfill v1 stub rows for any pre-existing presentations (idempotent)
+        self._backfill_v1_for_existing_presentations()
+
     def _create_tables(self):
         """Create all database tables"""
         Base.metadata.create_all(self.engine)
@@ -295,7 +299,177 @@ class DatabaseManager:
             session.commit()
             session.refresh(analysis)
             return analysis.to_dict()
-    
+
+    # ============== Presentation Versioning Management ==============
+
+    def save_presentation_version(self, version_data: Dict) -> Dict:
+        """Save a presentation version row.
+
+        v1 is written by the generation flow on every successful generation.
+        v2+ will be written by the future refinement flow. Caller must supply
+        all fields explicitly (lineage_id, version_number, label, session_id,
+        etc.). No defaulting is done here — bad input is a programmer error.
+        """
+        with self.get_session() as session:
+            version = PresentationVersion(**version_data)
+            session.add(version)
+            session.commit()
+            session.refresh(version)
+            return version.to_dict()
+
+    def get_lineages_for_session(self, session_id: str, limit: int = 20) -> List[Dict]:
+        """List lineages owned by a session, newest-first.
+
+        Aggregates over presentation_versions to produce one entry per
+        lineage with the latest version's number, label, and created_at,
+        plus the total version count. Ordering is by MAX(created_at) DESC
+        to match /api/history's convention.
+        """
+        max_limit = VERSIONING_CONFIG.get('max_lineage_list_limit', 100)
+        safe_limit = max(1, min(int(limit), max_limit))
+
+        with self.get_session() as s:
+            agg = (
+                s.query(
+                    PresentationVersion.lineage_id.label('lineage_id'),
+                    func.max(PresentationVersion.version_number).label('max_version'),
+                    func.count(PresentationVersion.id).label('total_versions'),
+                    func.max(PresentationVersion.created_at).label('latest_created_at'),
+                )
+                .filter(PresentationVersion.session_id == session_id)
+                .group_by(PresentationVersion.lineage_id)
+                .subquery()
+            )
+
+            rows = (
+                s.query(
+                    agg.c.lineage_id,
+                    agg.c.max_version,
+                    agg.c.total_versions,
+                    agg.c.latest_created_at,
+                    PresentationVersion.label,
+                )
+                .join(
+                    PresentationVersion,
+                    (PresentationVersion.lineage_id == agg.c.lineage_id)
+                    & (PresentationVersion.version_number == agg.c.max_version)
+                    & (PresentationVersion.session_id == session_id),
+                )
+                .order_by(agg.c.latest_created_at.desc())
+                .limit(safe_limit)
+                .all()
+            )
+
+            return [
+                {
+                    'lineage_id': r.lineage_id,
+                    'latest_version_number': r.max_version,
+                    'latest_version_label': r.label,
+                    'latest_version_created_at': r.latest_created_at.isoformat() if r.latest_created_at else None,
+                    'total_versions': r.total_versions,
+                }
+                for r in rows
+            ]
+
+    def get_versions_for_lineage(self, lineage_id: int, session_id: str) -> Optional[List[Dict]]:
+        """Return all versions in a lineage, chronological (oldest first).
+
+        Returns None when no rows match (lineage_id, session_id) — covers
+        both "lineage does not exist" and "lineage exists but owned by a
+        different session". The route translates this into the spec's
+        `not_found` error_type to avoid leaking lineage existence across
+        sessions.
+        """
+        with self.get_session() as s:
+            versions = (
+                s.query(PresentationVersion)
+                .filter_by(lineage_id=lineage_id, session_id=session_id)
+                .order_by(PresentationVersion.version_number.asc())
+                .all()
+            )
+            if not versions:
+                return None
+            return [v.to_dict() for v in versions]
+
+    def get_version(self, lineage_id: int, version_number: int, session_id: str) -> Optional[Dict]:
+        """Return a single version row, scoped to ownership.
+
+        Returns None when the row is missing or owned by a different
+        session (same existence-leak guard as get_versions_for_lineage).
+        """
+        with self.get_session() as s:
+            version = (
+                s.query(PresentationVersion)
+                .filter_by(
+                    lineage_id=lineage_id,
+                    version_number=version_number,
+                    session_id=session_id,
+                )
+                .first()
+            )
+            return version.to_dict() if version else None
+
+    def lineage_exists_for_session(self, lineage_id: int, session_id: str) -> bool:
+        """Cheap ownership probe used by the download route before send_file."""
+        with self.get_session() as s:
+            return (
+                s.query(PresentationVersion.id)
+                .filter_by(lineage_id=lineage_id, session_id=session_id)
+                .first()
+                is not None
+            )
+
+    def _backfill_v1_for_existing_presentations(self):
+        """Idempotent backfill: insert a stub v1 row for every
+        generation_history row that doesn't yet have a corresponding
+        presentation_versions entry.
+
+        Stub rows carry over file_path/filename/session_id/created_at from
+        generation_history so the download endpoint can still serve old
+        decks, but leave slide_structure NULL and set is_stub=True to
+        mark that the original generation pipeline didn't snapshot them.
+
+        Errors are caught and logged — backfill failure must not block
+        app startup (matches the existing leniency in initialize_database).
+        """
+        try:
+            with self.get_session() as s:
+                orphans = (
+                    s.query(GenerationHistory)
+                    .outerjoin(
+                        PresentationVersion,
+                        PresentationVersion.lineage_id == GenerationHistory.id,
+                    )
+                    .filter(PresentationVersion.id.is_(None))
+                    .all()
+                )
+
+                if not orphans:
+                    print("Versioning backfill: 0 rows to insert")
+                    return
+
+                v1_label = VERSIONING_CONFIG.get('v1_label', 'Initial generation')
+                inserted = 0
+                for gh in orphans:
+                    stub = PresentationVersion(
+                        lineage_id=gh.id,
+                        version_number=1,
+                        label=v1_label,
+                        note=None,
+                        slide_structure=None,
+                        file_path=gh.file_path,
+                        filename=gh.filename,
+                        is_stub=True,
+                        session_id=gh.session_id,
+                        created_at=gh.created_at,
+                    )
+                    s.add(stub)
+                    inserted += 1
+                s.commit()
+                print(f"Versioning backfill: inserted {inserted} stub v1 rows")
+        except Exception as e:
+            print(f"⚠️ Versioning backfill failed: {e}")
+
     # ============== Prompt Template Management (for LangChain) ==============
     
     def get_prompt_template(self, name: str) -> Optional[Dict]:

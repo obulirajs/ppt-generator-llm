@@ -452,5 +452,205 @@ def main():
         print("Invalid choice")
 
 
+# ==================== FEATURE 001: PRESENTATION VERSIONING API TESTS ====================
+
+def _cleanup_versioning_rows(session_ids):
+    """Delete every users/generation_history/presentation_versions row
+    whose session_id is in the given list. Idempotent; safe to call even
+    when nothing was seeded."""
+    import os, sqlite3
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'database', 'ppt_generator.db')
+    conn = sqlite3.connect(db_path)
+    deleted = {'pv': 0, 'gh': 0, 'user': 0}
+    for sid in session_ids:
+        if not sid:
+            continue
+        deleted['pv'] += conn.execute(
+            "DELETE FROM presentation_versions WHERE session_id = ?", (sid,)
+        ).rowcount
+        deleted['gh'] += conn.execute(
+            "DELETE FROM generation_history WHERE session_id = ?", (sid,)
+        ).rowcount
+        deleted['user'] += conn.execute(
+            "DELETE FROM users WHERE session_id = ?", (sid,)
+        ).rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def test_presentation_versioning_api():
+    """Feature 001 — Presentation Versioning API tests.
+
+    Hits the running Flask server. Seeds generation_history +
+    presentation_versions rows directly via DatabaseManager to skip the
+    slow Ollama POST (per tasks.md Task 11 notes). The seeded v1 row has
+    the same shape the live POST pipeline writes. Test rows are keyed by
+    the seeded session_id so cleanup is reliable.
+    """
+    import os, sys, hashlib
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from database.db_manager import init_database
+
+    print("\n🚀 Testing /api/lineages* routes (feature 001)...")
+
+    # --- Case 1: fresh session, no lineages ---
+    fresh = requests.Session()
+    r = fresh.get(f"{BASE_URL}/lineages", timeout=10)
+    assert r.status_code == 200, r.text[:300]
+    body = r.json()
+    assert body['success'] is True
+    assert body['lineages'] == []
+    assert body['total'] == 0
+    print("✅ Case 1: fresh session GET /api/lineages → 200, empty list")
+
+    # Discover the server-assigned session_id so seeded rows are owned by `fresh`
+    sid = fresh.get(f"{BASE_URL}/session", timeout=10).json()['session_id']
+    print(f"   Using primary session_id={sid[:8]}…")
+
+    # Pick an existing .pptx in temp/ so the download bytes-equality test works
+    upload_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+    real_pptx = None
+    if os.path.isdir(upload_dir):
+        candidates = sorted(
+            [f for f in os.listdir(upload_dir) if f.endswith('.pptx')],
+            reverse=True,
+        )
+        if candidates:
+            real_pptx = os.path.join(upload_dir, candidates[0])
+    placeholder_created = False
+    if not real_pptx:
+        os.makedirs(upload_dir, exist_ok=True)
+        real_pptx = os.path.join(upload_dir, 'test_api_versioning_placeholder.pptx')
+        with open(real_pptx, 'wb') as f:
+            f.write(b'PK\x05\x06' + b'\x00' * 18)  # minimal empty-zip bytes
+        placeholder_created = True
+    real_filename = os.path.basename(real_pptx)
+
+    other_sid = None  # captured later for cleanup
+    try:
+        db = init_database()
+
+        # Seed a generation_history + v1 row owned by `fresh`
+        gh = db.save_generation_history({
+            'session_id': sid, 'filename': real_filename, 'file_path': real_pptx,
+            'input_type': 'text', 'input_size': 100, 'model_used': 'llama3.2',
+        })
+        lid = gh['id']
+        db.save_presentation_version({
+            'lineage_id': lid, 'version_number': 1,
+            'label': 'Initial generation', 'note': None,
+            'slide_structure': {'slides': [{'title': 'Hello'}], 'title': 'T'},
+            'file_path': real_pptx, 'filename': real_filename,
+            'is_stub': False, 'session_id': sid,
+        })
+        print(f"   Seeded lineage_id={lid} (v1, session={sid[:8]}…, file={real_filename})")
+
+        # --- Case 2: lineage shows up in list ---
+        r = fresh.get(f"{BASE_URL}/lineages", timeout=10)
+        assert r.status_code == 200
+        body = r.json()
+        ours = [x for x in body['lineages'] if x['lineage_id'] == lid]
+        assert len(ours) == 1, f"lineage {lid} not in {body}"
+        e = ours[0]
+        assert e['latest_version_number'] == 1
+        assert e['latest_version_label'] == 'Initial generation'
+        assert e['total_versions'] == 1
+        print("✅ Case 2: lineage in list with latest_version_number=1 + 'Initial generation' label")
+
+        # --- Case 3: versions list ---
+        r = fresh.get(f"{BASE_URL}/lineages/{lid}/versions", timeout=10)
+        assert r.status_code == 200
+        body = r.json()
+        assert body['lineage_id'] == lid and body['total'] == 1
+        v = body['versions'][0]
+        assert v['version_number'] == 1
+        assert v['has_snapshot'] is True
+        assert 'slide_structure' not in v  # not projected in list responses
+        print("✅ Case 3: versions list returns one version, has_snapshot=true")
+
+        # --- Case 4: version detail ---
+        r = fresh.get(f"{BASE_URL}/lineages/{lid}/versions/1", timeout=10)
+        assert r.status_code == 200
+        body = r.json()
+        assert body['slide_structure'] is not None
+        assert body['is_stub'] is False
+        for key in ('lineage_id', 'version_number', 'label', 'note',
+                    'created_at', 'filename', 'slide_structure', 'is_stub'):
+            assert key in body, f"missing key {key}"
+        print("✅ Case 4: version detail returns non-null slide_structure, is_stub=false")
+
+        # --- Case 5: download, bytes equal legacy /api/download/<filename> ---
+        r = fresh.get(f"{BASE_URL}/lineages/{lid}/versions/1/download", timeout=10)
+        assert r.status_code == 200, r.text[:300]
+        ctype = r.headers.get('Content-Type', '')
+        assert ctype.startswith('application/vnd.openxmlformats'), f"got {ctype}"
+        assert len(r.content) > 0
+        legacy = fresh.get(f"{BASE_URL}/download/{real_filename}", timeout=10)
+        assert legacy.status_code == 200
+        assert hashlib.sha256(r.content).hexdigest() \
+            == hashlib.sha256(legacy.content).hexdigest(), \
+            "bytes diverge from legacy /api/download"
+        print(f"✅ Case 5: download 200, correct mimetype, {len(r.content)} bytes, SHA-256 matches legacy")
+
+        # --- Case 6: missing lineage → 404 not_found ---
+        r = fresh.get(f"{BASE_URL}/lineages/9999999/versions", timeout=10)
+        assert r.status_code == 404 and r.json().get('error_type') == 'not_found'
+        print("✅ Case 6: missing lineage → 404 not_found")
+
+        # --- Case 7: cross-session via second fresh session ---
+        other = requests.Session()
+        other_sid = other.get(f"{BASE_URL}/session", timeout=10).json()['session_id']
+        r = other.get(f"{BASE_URL}/lineages/{lid}/versions", timeout=10)
+        assert r.status_code == 404 and r.json().get('error_type') == 'not_found'
+        r = other.get(f"{BASE_URL}/lineages/{lid}/versions/1", timeout=10)
+        assert r.status_code == 404 and r.json().get('error_type') == 'not_found'
+        r = other.get(f"{BASE_URL}/lineages/{lid}/versions/1/download", timeout=10)
+        assert r.status_code == 404 and r.json().get('error_type') == 'not_found'
+        print("✅ Case 7: cross-session → 404 not_found on all three read routes")
+
+        # --- Case 8: stub row with file_path=NULL → 404 not_found ---
+        stub_lid = lid + 1_000_000  # synthetic id; FK isn't enforced in SQLite
+        db.save_presentation_version({
+            'lineage_id': stub_lid, 'version_number': 1,
+            'label': 'Initial generation', 'note': None,
+            'slide_structure': None, 'file_path': None, 'filename': None,
+            'is_stub': True, 'session_id': sid,
+        })
+        r = fresh.get(f"{BASE_URL}/lineages/{stub_lid}/versions/1/download", timeout=10)
+        assert r.status_code == 404 and r.json().get('error_type') == 'not_found'
+        print("✅ Case 8: stub row (file_path=NULL) download → 404 not_found")
+
+        print("\n✅ All presentation versioning API tests passed!")
+        return True
+
+    finally:
+        # Clean up everything keyed by our test session_ids
+        deleted = _cleanup_versioning_rows([sid, other_sid])
+        print(f"Cleanup: deleted pv={deleted['pv']}, gh={deleted['gh']}, "
+              f"users={deleted['user']}")
+        if placeholder_created and os.path.exists(real_pptx):
+            try:
+                os.remove(real_pptx)
+                print(f"Cleanup: removed placeholder pptx {real_filename}")
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == 'menu':
+        # Interactive menu preserved — `python test_api.py menu`
+        main()
+    else:
+        # Default: run the feature-001 API smoke tests and exit non-zero on failure
+        try:
+            ok = test_presentation_versioning_api()
+            if ok:
+                print("\n🎉 API tests passed!")
+        except Exception as e:
+            print(f"\n❌ {e}")
+            import traceback
+            traceback.print_exc()
+            _sys.exit(1)

@@ -206,3 +206,10 @@ LANGCHAIN_CONFIG = {
     'max_retries': 3,
     'retry_delay': 1  # seconds
 }
+
+# Presentation Versioning Configuration
+VERSIONING_CONFIG = {
+    'v1_label': 'Initial generation',
+    'default_lineage_list_limit': 20,
+    'max_lineage_list_limit': 100,
+}

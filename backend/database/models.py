@@ -2,7 +2,7 @@
 SQLAlchemy Database Models for PPT Generator
 """
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, Float, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, Float, DateTime, ForeignKey, JSON, UniqueConstraint, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.sql import func
@@ -312,4 +312,40 @@ class PromptTemplate(Base):
             'output_parser': self.output_parser,
             'version': self.version,
             'is_active': self.is_active
+        }
+
+# ============== Presentation Version Model ==============
+class PresentationVersion(Base):
+    __tablename__ = 'presentation_versions'
+    __table_args__ = (
+        UniqueConstraint('lineage_id', 'version_number', name='uq_presentation_versions_lineage_version'),
+        Index('ix_presentation_versions_session_id', 'session_id'),
+        Index('ix_presentation_versions_lineage_id', 'lineage_id'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lineage_id = Column(Integer, ForeignKey('generation_history.id', ondelete='CASCADE'), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    label = Column(Text, nullable=False)
+    note = Column(Text)
+    slide_structure = Column(JSON(none_as_null=True))
+    file_path = Column(String(500))
+    filename = Column(String(500))
+    is_stub = Column(Boolean, nullable=False, default=False)
+    session_id = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'lineage_id': self.lineage_id,
+            'version_number': self.version_number,
+            'label': self.label,
+            'note': self.note,
+            'slide_structure': self.slide_structure,
+            'file_path': self.file_path,
+            'filename': self.filename,
+            'is_stub': self.is_stub,
+            'session_id': self.session_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
